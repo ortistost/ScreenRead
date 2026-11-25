@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Liste Sayaç</string>
+    <string name="service_desc">Ekranda kaydırılan listedeki düğmeleri şekline göre sayar ve üstte panel gösterir.</string>
+</resources>
