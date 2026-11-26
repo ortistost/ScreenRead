@@ -34,12 +34,9 @@ import kotlin.math.min
 object Detector {
     const val DARK_LUM = 62     // bundan koyu piksel "kenar" sayılır (0-255 parlaklık)
     const val SCALE = 2         // maske yarı çözünürlükte çıkarılır (hız)
-    const val GRAY_F = 4        // kaydırma takibi için gri küçültme oranı
-    const val MAX_SHIFT_ERR = 28f
 
     class Box(val x: Int, val y: Int, val w: Int, val h: Int)
     class Comp(val box: Box, val touchesEdge: Boolean, val pixels: Int)
-    class Gray(val g: IntArray, val gw: Int, val gh: Int)
 
     private fun lum(p: Int): Int =
         (77 * ((p shr 16) and 255) + 151 * ((p shr 8) and 255) + 28 * (p and 255)) shr 8
@@ -111,106 +108,83 @@ object Detector {
             .map { it.box }
             .sortedWith(compareBy({ it.y / (th / 2).coerceAtLeast(1) }, { it.x }))
 
-    fun gray(px: IntArray, w: Int, h: Int): Gray {
-        val gw = w / GRAY_F
-        val gh = h / GRAY_F
-        val g = IntArray(gw * gh)
-        for (gy in 0 until gh) for (gx in 0 until gw) {
-            var s = 0
-            for (oy in 0 until GRAY_F step 2) for (ox in 0 until GRAY_F step 2)
-                s += lum(px[(gy * GRAY_F + oy) * w + gx * GRAY_F + ox])
-            g[gy * gw + gx] = s / 4
-        }
-        return Gray(g, gw, gh)
-    }
-
-    // cur[y] ~ prev[y + s]. s > 0: içerik yukarı kaydı (liste aşağı kaydırıldı).
-    // Dönüş: (s gri-satır, ortalama hata). Eşitlikte küçük |s| tercih edilir.
-    fun estimateShift(prev: Gray, cur: Gray): Pair<Int, Float>? {
-        if (prev.gw != cur.gw || prev.gh != cur.gh) return null
-        val gw = cur.gw
-        val gh = cur.gh
-        val maxS = (gh * 0.75f).toInt()
-        var bestS = 0
-        var bestE = Float.MAX_VALUE
-        for (k in 0..maxS) {
-            for (sg in if (k == 0) intArrayOf(1) else intArrayOf(1, -1)) {
-                val s = k * sg
-                val y0 = if (s < 0) -s else 0
-                val y1 = if (s > 0) gh - s else gh
-                if (y1 - y0 < gh / 4) continue
-                var sum = 0L
-                var cnt = 0
-                var y = y0
-                while (y < y1) {
-                    var x = 0
-                    while (x < gw) {
-                        sum += abs(cur.g[y * gw + x] - prev.g[(y + s) * gw + x])
-                        cnt++
-                        x += 2
-                    }
-                    y += 2
-                }
-                if (cnt == 0) continue
-                val e = sum.toFloat() / cnt
-                if (e < bestE * 0.97f) { bestE = e; bestS = s }
+    // Kaba (yarı çözünürlük) kutuyu tam çözünürlükte netleştirir: kutunun çevresindeki koyu piksellerin sınırı.
+    fun refine(px: IntArray, w: Int, h: Int, b: Box): Box {
+        val pad = 4
+        val x0 = (b.x - pad).coerceAtLeast(0); val x1 = (b.x + b.w + pad).coerceAtMost(w) - 1
+        val y0 = (b.y - pad).coerceAtLeast(0); val y1 = (b.y + b.h + pad).coerceAtMost(h) - 1
+        var minX = Int.MAX_VALUE; var maxX = -1; var minY = Int.MAX_VALUE; var maxY = -1
+        for (y in y0..y1) for (x in x0..x1) {
+            if (lum(px[y * w + x]) < DARK_LUM) {
+                if (x < minX) minX = x
+                if (x > maxX) maxX = x
+                if (y < minY) minY = y
+                if (y > maxY) maxY = y
             }
         }
-        return if (bestE == Float.MAX_VALUE) null else bestS to bestE
+        return if (maxX < 0) b else Box(minX, minY, maxX - minX + 1, maxY - minY + 1)
     }
 
-    // Aynı düğmeyi tekrar saymayan kayıt. Konumlar liste başına göre (genel) koordinattır.
-    class Counter {
-        private val gx = ArrayList<Int>()
-        private val gy = ArrayList<Int>()
+    // Düğmenin içinin (kenar payı atılmış) 32x10'luk gri özeti: aynı yazı = benzer özet, yeri önemli değil.
+    const val SIG_W = 32
+    const val SIG_H = 10
+    const val SIG_TOL = 10
+
+    fun signature(px: IntArray, w: Int, h: Int, b: Box): IntArray {
+        val ix = (b.w * 0.08f).toInt(); val iy = (b.h * 0.12f).toInt()
+        val x0 = b.x + ix; val y0 = b.y + iy
+        val cw = b.w - 2 * ix; val ch = b.h - 2 * iy
+        val out = IntArray(SIG_W * SIG_H)
+        for (j in 0 until SIG_H) for (i in 0 until SIG_W) {
+            val xs = x0 + i * cw / SIG_W; val xe = maxOf(xs + 1, x0 + (i + 1) * cw / SIG_W)
+            val ys = y0 + j * ch / SIG_H; val ye = maxOf(ys + 1, y0 + (j + 1) * ch / SIG_H)
+            var sum = 0; var n = 0
+            for (y in ys until minOf(ye, h)) for (x in xs until minOf(xe, w)) { sum += lum(px[y * w + x]); n++ }
+            out[j * SIG_W + i] = if (n > 0) sum / n else 0
+        }
+        return out
+    }
+
+    // Ekranda görülen düğmeleri hatırlar. Aynı düğme (aynı özet) tekrar görülünce yeni sayılmaz,
+    // eski numarasını alır. Numara = ilk görülme sırası (1'den).
+    class Registry {
+        private val sigs = ArrayList<IntArray>()
         private val reads = ArrayList<ArrayList<String>>()
-        var offset = 0
-            private set
 
-        val total: Int get() = gx.size
+        val total: Int get() = sigs.size
 
-        fun reset() { gx.clear(); gy.clear(); reads.clear(); offset = 0 }
+        fun reset() { sigs.clear(); reads.clear() }
 
-        fun scroll(px: Int) { offset += px }
-
-        fun register(boxes: List<Box>, tw: Int, th: Int): List<Int> {
-            val out = ArrayList<Int>()
-            for (b in boxes) {
-                val y = b.y + offset
-                var found = -1
-                for (i in gx.indices) {
-                    if (abs(gx[i] - b.x) < tw / 2 && abs(gy[i] - y) < th / 2) { found = i; break }
-                }
-                if (found < 0) { gx.add(b.x); gy.add(y); reads.add(ArrayList()); found = gx.size - 1 }
-                else gy[found] = (gy[found] + y) / 2
-                out.add(found)
+        // Kayıtlı düğmelerden en benzeyeni (fark < SIG_TOL) ya da -1
+        fun find(sig: IntArray): Int {
+            var best = -1
+            var bestD = Int.MAX_VALUE
+            for (i in sigs.indices) {
+                val o = sigs[i]
+                var sum = 0
+                for (k in sig.indices) sum += abs(sig[k] - o[k])
+                val d = sum / sig.size
+                if (d < bestD) { bestD = d; best = i }
             }
-            return out
+            return if (bestD < SIG_TOL) best else -1
+        }
+
+        // Varsa eskisinin numarasını (0'dan), yoksa yeni kayıt açıp onun numarasını döndürür
+        fun idOf(sig: IntArray): Int {
+            val f = find(sig)
+            if (f >= 0) return f
+            sigs.add(sig); reads.add(ArrayList())
+            return sigs.size - 1
         }
 
         fun readCount(i: Int) = reads[i].size
         fun addRead(i: Int, s: String) { if (i in reads.indices) reads[i].add(s) }
 
-        // En çok tekrarlanan okuma (eşitlikte uzun olan); hiç okuma yoksa null
         fun best(i: Int): String? {
             if (i !in reads.indices || reads[i].isEmpty()) return null
             return reads[i].groupingBy { it }.eachCount().entries
                 .sortedWith(compareByDescending<Map.Entry<String, Int>> { it.value }.thenByDescending { it.key.length })
                 .first().key
-        }
-
-        // Gösterim sırası: satır satır, soldan sağa (en sol üst = 1). Dönüş: kayıt numaraları sırayla.
-        fun order(th: Int): List<Int> {
-            val idx = gx.indices.sortedBy { gy[it] }
-            val rows = ArrayList<ArrayList<Int>>()
-            var rowStart = 0
-            for (i in idx) {
-                if (rows.isEmpty() || gy[i] - rowStart > th / 2) { rows.add(ArrayList()); rowStart = gy[i] }
-                rows.last().add(i)
-            }
-            val out = ArrayList<Int>()
-            for (r in rows) out.addAll(r.sortedBy { gx[it] })
-            return out
         }
     }
 }
@@ -231,15 +205,13 @@ class CounterService : AccessibilityService() {
     private var statusTv: TextView? = null
     private var startTv: TextView? = null
     private var a1Tv: TextView? = null
-    private var a2Tv: TextView? = null
     private var copyTv: TextView? = null
     private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
     private val inflight = HashSet<Int>()
 
     @Volatile private var running = false
     @Volatile private var shotBusy = false
-    private val counter = Detector.Counter()
-    private var prevGray: Detector.Gray? = null
+    private val counter = Detector.Registry()
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun toast(s: String) { ui.post { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() } }
@@ -364,10 +336,9 @@ class CounterService : AccessibilityService() {
             setPadding(0, 0, 0, dp(2))
         }
         box.addView(head)
-        val a1 = btn("1. alan: TEK düğme", "#1E88E5") { pickArea(1) }
-        val a2 = btn("2. alan: 3'lü liste", "#00897B") { pickArea(2) }
-        a1Tv = a1; a2Tv = a2
-        box.addView(a1); box.addView(a2)
+        val a1 = btn("Alan seç: TEK düğme", "#1E88E5") { pickArea(1) }
+        a1Tv = a1
+        box.addView(a1)
         val st = btn("Başlat", "#43A047") { toggle() }
         startTv = st
         box.addView(st)
@@ -422,8 +393,7 @@ class CounterService : AccessibilityService() {
 
     private fun refreshPanel() {
         ui.post {
-            a1Tv?.text = if (areaSet(1) && tw() > 0) "1. alan ✓ (${tw()}×${th()} px)" else "1. alan: TEK düğme"
-            a2Tv?.text = if (areaSet(2)) "2. alan ✓" else "2. alan: 3'lü liste"
+            a1Tv?.text = if (tw() > 0) "Düğme şekli ✓ (${tw()}×${th()} px)" else "Alan seç: TEK düğme"
             startTv?.text = if (running) "Durdur" else "Başlat"
             (startTv?.background as? GradientDrawable)?.setColor(Color.parseColor(if (running) "#E53935" else "#43A047"))
             val canCopy = !running && synchronized(counter) { counter.total } > 0
@@ -490,18 +460,17 @@ class CounterService : AccessibilityService() {
         try { wm.addView(v, lp) } catch (_: Exception) { toast("Alan seçimi açılamadı"); return }
         selectLayer = v
         raisePanel()
-        toast(if (n == 1) "TEK bir düğmeyi sürükleyerek sıkıca çevrele" else "3'lü düğmelerin bulunduğu liste alanını sürükleyerek çevrele")
+        toast("TEK bir düğmeyi, kenarlarıyla birlikte sürükleyerek sıkıca çevrele")
     }
 
     private fun saveArea(n: Int, f: FloatArray) {
         prefs.edit().putFloat("a${n}x1", f[0]).putFloat("a${n}y1", f[1])
             .putFloat("a${n}x2", f[2]).putFloat("a${n}y2", f[3]).apply()
-        if (n == 2) { refreshPanel(); toast("2. alan kaydedildi"); return }
         // 1. alan: düğme şekli (boyutu) hemen ölçülür
         prefs.edit().remove("tw").remove("th").apply()
         ui.postDelayed({
             shot { bmp ->
-                if (bmp == null) { toast("Ekran alınamadı, 1. alanı tekrar seç"); return@shot }
+                if (bmp == null) { toast("Ekran alınamadı, alanı tekrar seç"); return@shot }
                 val px = cropPixels(bmp, f)
                 val size = px?.let { Detector.templateSize(it.first, it.second, it.third) }
                 if (size == null) {
@@ -560,21 +529,14 @@ class CounterService : AccessibilityService() {
 
     // ---------- Sayma ----------
 
-    private fun area(n: Int): FloatArray? =
-        if (!areaSet(n)) null
-        else floatArrayOf(prefs.getFloat("a${n}x1", 0f), prefs.getFloat("a${n}y1", 0f),
-            prefs.getFloat("a${n}x2", 0f), prefs.getFloat("a${n}y2", 0f))
-
     private fun toggle() {
         if (running) { stopCount(); return }
         if (selectLayer != null) { removeView(selectLayer); selectLayer = null }
-        if (area(2) == null) { toast("Önce 2. alanı (3'lü liste) seç"); return }
-        if (tw() <= 0 || th() <= 0) { toast("Önce 1. alanı (tek düğme) seç, şekil alınmalı"); return }
+        if (tw() <= 0 || th() <= 0) { toast("Önce tek bir düğmenin alanını seç, şekil alınmalı"); return }
         synchronized(counter) { counter.reset() }
-        prevGray = null
         running = true
         refreshPanel()
-        setStatus("Sayı: 0 (listeyi yavaşça aşağı kaydır)")
+        setStatus("Sayı: 0 (listeyi kaydır)")
         ui.post(tick)
     }
 
@@ -591,7 +553,6 @@ class CounterService : AccessibilityService() {
     private fun resetCount() {
         if (running) { toast("Önce durdur"); return }
         synchronized(counter) { counter.reset() }
-        prevGray = null
         outline?.set(emptyList())
         refreshPanel()
         setStatus("Sıfırlandı")
@@ -606,52 +567,31 @@ class CounterService : AccessibilityService() {
     }
 
     // Arka plan iş parçacığı
+    // Arka plan iş parçacığı: ekrandaki TÜM düğmeleri bulur, tanır (hatırlar) ve numaralar
     private fun process(bmp: Bitmap) {
         if (!running) return
-        val a = area(2) ?: return
         val tw = tw(); val th = th()
-        val crop = cropPixels(bmp, a) ?: return
-        val px = crop.first; val w = crop.second; val h = crop.third
-        val l = (a[0] * bmp.width).toInt().coerceIn(0, bmp.width - 1)
-        val t = (a[1] * bmp.height).toInt().coerceIn(0, bmp.height - 1)
+        val w = bmp.width; val h = bmp.height
+        val px = IntArray(w * h)
+        bmp.getPixels(px, 0, w, 0, 0, w, h)
         val screen = wm.currentWindowMetrics.bounds
-        val kx = screen.width().toFloat() / bmp.width
-        val ky = screen.height().toFloat() / bmp.height
+        val kx = screen.width().toFloat() / w
+        val ky = screen.height().toFloat() / h
 
-        val boxes = Detector.findButtons(px, w, h, tw, th)
-        val gr = Detector.gray(px, w, h)
-        val prev = prevGray
-        var ok = true
-        if (prev != null && prev.gw == gr.gw && prev.gh == gr.gh) {
-            val r = Detector.estimateShift(prev, gr)
-            if (r == null || r.second > Detector.MAX_SHIFT_ERR) ok = false
-            else synchronized(counter) { counter.scroll(r.first * Detector.GRAY_F) }
-        }
-        prevGray = gr
-
-        if (!ok) {
-            setStatus("Sayı: ${synchronized(counter) { counter.total }} — takip kayboldu, daha yavaş kaydır")
-            ui.post { outline?.set(emptyList()) }
-            return
-        }
-        val rank = HashMap<Int, Int>()
+        val boxes = Detector.findButtons(px, w, h, tw, th).map { Detector.refine(px, w, h, it) }
+        val sigs = boxes.map { Detector.signature(px, w, h, it) }
         val info = synchronized(counter) {
-            val ids = counter.register(boxes, tw, th)
-            counter.order(th).forEachIndexed { n, i -> rank[i] = n + 1 }
+            val ids = sigs.map { counter.idOf(it) }
             Triple(ids, counter.total, (0 until counter.total).count { counter.best(it) != null })
         }
-        val idx = info.first
-        val total = info.second
-        val readN = info.third
+        val ids = info.first
         val shown = boxes.mapIndexed { i, b ->
-            Shown(RectF((l + b.x) * kx, (t + b.y) * ky, (l + b.x + b.w) * kx, (t + b.y + b.h) * ky), rank[idx[i]] ?: 0)
+            Shown(RectF(b.x * kx, b.y * ky, (b.x + b.w) * kx, (b.y + b.h) * ky), ids[i] + 1)
         }
-        for (i in boxes.indices) ocrButton(bmp, boxes[i], l, t, idx[i])
+        for (i in boxes.indices) ocrButton(bmp, boxes[i], 0, 0, ids[i])
         ui.post { if (running) outline?.set(shown) }
-        setStatus("Sayı: $total, okunan: $readN (ekranda ${boxes.size})")
+        setStatus("Sayı: ${info.second}, okunan: ${info.third} (ekranda ${boxes.size})")
     }
-
-    // ---------- Yazı okuma (düğme şeklinden bağımsız; sadece sayılan düğmenin metni) ----------
 
     private fun clean(s: String) = s.replace('\n', ' ').replace(Regex("\\s+"), " ").trim()
 
@@ -711,16 +651,13 @@ class CounterService : AccessibilityService() {
 
     private fun copyList() {
         val (running0, lines) = synchronized(counter) {
-            running to counter.order(th()).mapIndexed { n, i -> "${n + 1}. ${counter.best(i) ?: "(okunamadı)"}" }
+            running to (0 until counter.total).map { "${it + 1}. ${counter.best(it) ?: "(okunamadı)"}" }
         }
         if (running0 || lines.isEmpty()) { toast("Önce başlat, en az 1 düğme oku, sonra Durdur"); return }
         val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
         cm.setPrimaryClip(ClipData.newPlainText("liste", lines.joinToString("\n")))
         toast("Kopyalandı (${lines.size} satır)")
     }
-
-    // ---------- Koyu mavi çerçeve + numara ----------
-    // Rengin parlaklığı Detector.DARK_LUM üstünde: görüntüye girse bile "koyu kenar" sayılmaz.
 
     private inner class OutlineView(ctx: Context) : View(ctx) {
         private var items: List<Shown> = emptyList()
