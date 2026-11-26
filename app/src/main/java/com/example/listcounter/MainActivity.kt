@@ -5,13 +5,14 @@ import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
 import android.provider.Settings
-import android.view.Gravity
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 
 class MainActivity : Activity() {
+    private lateinit var status: TextView
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val d = resources.displayMetrics.density
@@ -25,23 +26,49 @@ class MainActivity : Activity() {
         }
         val ver = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { "?" }
         col.addView(tv("Liste Sayaç  v$ver", 22f))
-        col.addView(tv(
-            "1) Aşağıdaki düğmeden Erişilebilirlik ayarlarını aç, \"Liste Sayaç\" servisini etkinleştir.\n" +
-                "2) Servis açılınca ekranın üstünde her zaman görünen küçük bir panel çıkar.\n" +
-                "3) \"1. alan\": sürükleyerek TEK bir düğmeyi çevrele (şekil örneği).\n" +
-                "4) \"2. alan\": sürükleyerek listenin (3'lü satırların) bulunduğu alanı çevrele.\n" +
-                "5) \"Başlat\": listeyi yavaşça aşağı kaydır. Düğmeler koyu mavi çerçeve ve numarayla işaretlenir, yazıları okunur.\n" +
-                "6) En alta inince \"Durdur\". Sonra \"Kopyala\" ile listeyi al.",
-            15f, Color.parseColor("#C9D6F2")
-        ))
+        status = tv("", 16f, Color.parseColor("#FFD54F"))
+        col.addView(status)
+        col.addView(Button(this).apply {
+            text = "Paneli GÖSTER"
+            setOnClickListener {
+                val s = CounterService.instance
+                if (s == null) status.text = "Servis kapalı: önce Erişilebilirlik'ten etkinleştir"
+                else { s.setPanelVisible(true); refresh() }
+            }
+        })
+        col.addView(Button(this).apply {
+            text = "Paneli GİZLE"
+            setOnClickListener {
+                val s = CounterService.instance
+                if (s == null) status.text = "Servis kapalı: önce Erişilebilirlik'ten etkinleştir"
+                else { s.setPanelVisible(false); refresh() }
+            }
+        })
         col.addView(Button(this).apply {
             text = "Erişilebilirlik ayarlarını aç"
             setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
         })
         col.addView(tv(
-            "Güncelleme: yeni APK'yı eskisinin üstüne direkt yükleyebilirsin.",
-            13f, Color.parseColor("#8FA3CC")
-        ).apply { gravity = Gravity.START })
+            "Erişilebilirlik servisi hep açık kalsın; paneli buradan veya panelin \"Gizle\" düğmesinden gizle/göster. " +
+                "Panel gizliyken ekranda ☰ düğmesi kalır (sürüklenir, dokununca panel açılır).\n\n" +
+                "1. alan: tek düğmeyi çevrele. 2. alan: listeyi çevrele. Başlat: yavaşça aşağı kaydır. " +
+                "Durdur: toplam sayı. Kopyala: \"1. Ad (KOD)\" listesini panoya alır.",
+            14f, Color.parseColor("#C9D6F2")
+        ))
         setContentView(ScrollView(this).apply { addView(col) })
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refresh()
+    }
+
+    private fun refresh() {
+        val s = CounterService.instance
+        status.text = when {
+            s == null -> "Servis kapalı. Erişilebilirlik'ten \"Liste Sayaç\" servisini etkinleştir."
+            s.isPanelVisible() -> "Servis çalışıyor, panel görünür."
+            else -> "Servis çalışıyor, panel gizli (☰ düğmesi ekranda)."
+        }
     }
 }
