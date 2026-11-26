@@ -51,8 +51,8 @@ class MainActivity : Activity() {
         col.addView(tv(
             "Erişilebilirlik servisi hep açık kalsın; paneli buradan veya panelin \"Gizle\" düğmesinden gizle/göster. " +
                 "Panel gizliyken ekranda ☰ düğmesi kalır (sürüklenir, dokununca panel açılır).\n\n" +
-                "1. alan: tek düğmeyi çevrele. 2. alan: listeyi çevrele. Başlat: yavaşça aşağı kaydır. " +
-                "Durdur: toplam sayı. Kopyala: \"1. Ad (KOD)\" listesini panoya alır.",
+                "Alan seç: tek bir düğmeyi çevrele (şekil örneği). Başlat: listeyi kaydır; ekrandaki tüm düğmeler numaralanır, " +
+                "görülenler hatırlanır, tekrar sayılmaz. Durdur: toplam sayı. Kopyala: \"1. Ad (KOD)\" listesini panoya alır.",
             14f, Color.parseColor("#C9D6F2")
         ))
         setContentView(ScrollView(this).apply { addView(col) })
