@@ -32,9 +32,9 @@ import kotlin.math.max
 import kotlin.math.min
 
 object Detector {
-    const val DARK_LUM = 62
-    const val SCALE = 2
-    const val GRAY_F = 4
+    const val DARK_LUM = 62     // bundan koyu piksel "kenar" sayılır (0-255 parlaklık)
+    const val SCALE = 2         // maske yarı çözünürlükte çıkarılır (hız)
+    const val GRAY_F = 4        // kaydırma takibi için gri küçültme oranı
     const val MAX_SHIFT_ERR = 28f
 
     class Box(val x: Int, val y: Int, val w: Int, val h: Int)
@@ -44,6 +44,7 @@ object Detector {
     private fun lum(p: Int): Int =
         (77 * ((p shr 16) and 255) + 151 * ((p shr 8) and 255) + 28 * (p and 255)) shr 8
 
+    // Koyu piksellerin bağlı bileşenleri (8 komşuluk). Kutular tam çözünürlük pikselidir.
     fun components(px: IntArray, w: Int, h: Int): List<Comp> {
         val mw = w / SCALE
         val mh = h / SCALE
@@ -92,6 +93,7 @@ object Detector {
         return out
     }
 
+    // Tek düğmeyi çevreleyen alandan düğme boyutu: en büyük koyu çerçeve bileşeni (alanın en az %40'ı)
     fun templateSize(px: IntArray, w: Int, h: Int): Pair<Int, Int>? {
         val best = components(px, w, h)
             .filter { it.box.w >= w * 0.4 && it.box.h >= h * 0.4 }
@@ -99,6 +101,7 @@ object Detector {
         return best.box.w to best.box.h
     }
 
+    // Boyutu şablona (±tol) uyan, alan kenarına değmeyen çerçeveler = düğmeler
     fun findButtons(px: IntArray, w: Int, h: Int, tw: Int, th: Int, tol: Float = 0.15f): List<Box> =
         components(px, w, h)
             .filter { !it.touchesEdge }
@@ -121,6 +124,8 @@ object Detector {
         return Gray(g, gw, gh)
     }
 
+    // cur[y] ~ prev[y + s]. s > 0: içerik yukarı kaydı (liste aşağı kaydırıldı).
+    // Dönüş: (s gri-satır, ortalama hata). Eşitlikte küçük |s| tercih edilir.
     fun estimateShift(prev: Gray, cur: Gray): Pair<Int, Float>? {
         if (prev.gw != cur.gw || prev.gh != cur.gh) return null
         val gw = cur.gw
@@ -154,6 +159,7 @@ object Detector {
         return if (bestE == Float.MAX_VALUE) null else bestS to bestE
     }
 
+    // Aynı düğmeyi tekrar saymayan kayıt. Konumlar liste başına göre (genel) koordinattır.
     class Counter {
         private val gx = ArrayList<Int>()
         private val gy = ArrayList<Int>()
@@ -185,6 +191,7 @@ object Detector {
         fun readCount(i: Int) = reads[i].size
         fun addRead(i: Int, s: String) { if (i in reads.indices) reads[i].add(s) }
 
+        // En çok tekrarlanan okuma (eşitlikte uzun olan); hiç okuma yoksa null
         fun best(i: Int): String? {
             if (i !in reads.indices || reads[i].isEmpty()) return null
             return reads[i].groupingBy { it }.eachCount().entries
@@ -192,6 +199,7 @@ object Detector {
                 .first().key
         }
 
+        // Gösterim sırası: satır satır, soldan sağa (en sol üst = 1). Dönüş: kayıt numaraları sırayla.
         fun order(th: Int): List<Int> {
             val idx = gx.indices.sortedBy { gy[it] }
             val rows = ArrayList<ArrayList<Int>>()
@@ -240,16 +248,79 @@ class CounterService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
     override fun onInterrupt() {}
 
+    companion object {
+        @Volatile var instance: CounterService? = null
+    }
+
+    private var bubble: View? = null
+
     override fun onServiceConnected() {
         super.onServiceConnected()
+        instance = this
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        showOutline()
-        showPanel()
-        refreshPanel()
+        try {
+            showOutline()
+            showPanel()
+            refreshPanel()
+            setPanelVisible(!prefs.getBoolean("hidden", false))
+            toast("Liste Sayaç hazır")
+        } catch (e: Exception) {
+            toast("Panel açılamadı: ${e.message}")
+        }
+    }
+
+    fun isPanelVisible(): Boolean = panel?.visibility == View.VISIBLE
+
+    fun setPanelVisible(v: Boolean) {
+        ui.post {
+            prefs.edit().putBoolean("hidden", !v).apply()
+            panel?.visibility = if (v) View.VISIBLE else View.GONE
+            if (v) { removeView(bubble); bubble = null } else showBubble()
+        }
+    }
+
+    // Panel gizliyken ekranda kalan, sürüklenebilen küçük düğme; dokununca panel açılır
+    private fun showBubble() {
+        if (bubble != null) return
+        val tv = TextView(this).apply {
+            text = "☰"; textSize = 20f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#E61E88E5")); setStroke(dp(1), Color.WHITE)
+            }
+        }
+        val sz = dp(46)
+        val lp = WindowManager.LayoutParams(
+            sz, sz, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START; x = prefs.getInt("bx", dp(8)); y = prefs.getInt("by", dp(120)) }
+        var dx = 0f; var dy = 0f; var sx = 0; var sy = 0; var moved = false
+        tv.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { dx = e.rawX; dy = e.rawY; sx = lp.x; sy = lp.y; moved = false }
+                MotionEvent.ACTION_MOVE -> {
+                    if (abs(e.rawX - dx) > dp(8) || abs(e.rawY - dy) > dp(8)) moved = true
+                    if (moved) {
+                        val b = wm.currentWindowMetrics.bounds
+                        lp.x = (sx + (e.rawX - dx).toInt()).coerceIn(0, max(0, b.width() - sz))
+                        lp.y = (sy + (e.rawY - dy).toInt()).coerceIn(0, max(0, b.height() - sz))
+                        try { wm.updateViewLayout(tv, lp) } catch (_: Exception) {}
+                    }
+                }
+                MotionEvent.ACTION_UP ->
+                    if (!moved) setPanelVisible(true)
+                    else prefs.edit().putInt("bx", lp.x).putInt("by", lp.y).apply()
+            }
+            true
+        }
+        try { wm.addView(tv, lp); bubble = tv } catch (_: Exception) {}
     }
 
     override fun onDestroy() {
+        instance = null
         running = false
+        removeView(bubble); bubble = null
         ui.removeCallbacksAndMessages(null)
         removeView(selectLayer); selectLayer = null
         removeView(outline); outline = null
@@ -258,6 +329,8 @@ class CounterService : AccessibilityService() {
         bg.shutdown()
         super.onDestroy()
     }
+
+    // ---------- Panel (her zaman üstte) ----------
 
     private fun btn(label: String, color: String, act: () -> Unit) = TextView(this).apply {
         text = label
@@ -302,6 +375,7 @@ class CounterService : AccessibilityService() {
         val cp = btn("Kopyala", "#3A4658") { copyList() }
         copyTv = cp
         box.addView(cp)
+        box.addView(btn("Gizle", "#455A64") { setPanelVisible(false) })
         val status = TextView(this).apply {
             textSize = 12f
             setTextColor(Color.WHITE)
@@ -359,6 +433,8 @@ class CounterService : AccessibilityService() {
     }
 
     private fun setStatus(t: String) { ui.post { statusTv?.text = t } }
+
+    // ---------- Alan seçme (sürükle) ----------
 
     private inner class SelectView(ctx: Context, private val done: (FloatArray?) -> Unit) : View(ctx) {
         private val fill = Paint().apply { style = Paint.Style.FILL; color = Color.parseColor("#3300E5FF") }
@@ -421,6 +497,7 @@ class CounterService : AccessibilityService() {
         prefs.edit().putFloat("a${n}x1", f[0]).putFloat("a${n}y1", f[1])
             .putFloat("a${n}x2", f[2]).putFloat("a${n}y2", f[3]).apply()
         if (n == 2) { refreshPanel(); toast("2. alan kaydedildi"); return }
+        // 1. alan: düğme şekli (boyutu) hemen ölçülür
         prefs.edit().remove("tw").remove("th").apply()
         ui.postDelayed({
             shot { bmp ->
@@ -438,6 +515,9 @@ class CounterService : AccessibilityService() {
         }, 350)
     }
 
+    // ---------- Ekran görüntüsü ----------
+
+    // cb arka plan iş parçacığında çağrılır; bitmap yalnızca cb boyunca geçerli
     private fun shot(cb: (Bitmap?) -> Unit) {
         if (shotBusy) { cb(null); return }
         shotBusy = true
@@ -465,6 +545,7 @@ class CounterService : AccessibilityService() {
         }
     }
 
+    // (pikseller, genişlik, yükseklik) ve sol/üst piksel ofseti
     private fun cropPixels(bmp: Bitmap, f: FloatArray): Triple<IntArray, Int, Int>? {
         val l = (f[0] * bmp.width).toInt().coerceIn(0, bmp.width - 1)
         val t = (f[1] * bmp.height).toInt().coerceIn(0, bmp.height - 1)
@@ -476,7 +557,10 @@ class CounterService : AccessibilityService() {
         bmp.getPixels(px, 0, w, l, t, w, h)
         return Triple(px, w, h)
     }
-        private fun area(n: Int): FloatArray? =
+
+    // ---------- Sayma ----------
+
+    private fun area(n: Int): FloatArray? =
         if (!areaSet(n)) null
         else floatArrayOf(prefs.getFloat("a${n}x1", 0f), prefs.getFloat("a${n}y1", 0f),
             prefs.getFloat("a${n}x2", 0f), prefs.getFloat("a${n}y2", 0f))
@@ -521,6 +605,7 @@ class CounterService : AccessibilityService() {
         }
     }
 
+    // Arka plan iş parçacığı
     private fun process(bmp: Bitmap) {
         if (!running) return
         val a = area(2) ?: return
@@ -566,8 +651,11 @@ class CounterService : AccessibilityService() {
         setStatus("Sayı: $total, okunan: $readN (ekranda ${boxes.size})")
     }
 
+    // ---------- Yazı okuma (düğme şeklinden bağımsız; sadece sayılan düğmenin metni) ----------
+
     private fun clean(s: String) = s.replace('\n', ' ').replace(Regex("\\s+"), " ").trim()
 
+    // Beyaz yazı siyah, gerisi beyaz: koyu kontur ve mavi zemin silinir. 2x büyütülür.
     private fun binarize(src: Bitmap): Bitmap {
         val w = src.width * 2; val h = src.height * 2
         val big = Bitmap.createScaledBitmap(src, w, h, true)
@@ -612,6 +700,7 @@ class CounterService : AccessibilityService() {
                 bin.recycle()
                 if (tx.isNotEmpty()) { crop.recycle(); done(tx) }
                 else {
+                    // yedek: özgün renkli kırpma
                     recognizer.process(InputImage.fromBitmap(crop, 0))
                         .addOnSuccessListener { r2 -> crop.recycle(); done(clean(r2.text)) }
                         .addOnFailureListener { crop.recycle(); done(null) }
@@ -629,6 +718,9 @@ class CounterService : AccessibilityService() {
         cm.setPrimaryClip(ClipData.newPlainText("liste", lines.joinToString("\n")))
         toast("Kopyalandı (${lines.size} satır)")
     }
+
+    // ---------- Koyu mavi çerçeve + numara ----------
+    // Rengin parlaklığı Detector.DARK_LUM üstünde: görüntüye girse bile "koyu kenar" sayılmaz.
 
     private inner class OutlineView(ctx: Context) : View(ctx) {
         private var items: List<Shown> = emptyList()
@@ -673,4 +765,5 @@ class CounterService : AccessibilityService() {
         outline = v
         wm.addView(v, lp)
     }
+
 }
